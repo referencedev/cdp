@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "contracts/cdp",
+    "integration-tests",
+]
+resolver = "2"
