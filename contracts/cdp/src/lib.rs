@@ -20,11 +20,13 @@ use near_sdk::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const BPS_DENOMINATOR: u128 = 10_000;
 const GAS_FOR_SWAP: Gas = Gas::from_tgas(50);
 const GAS_FOR_CALLBACK: Gas = Gas::from_tgas(25);
 const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(10);
+const REWARD_SCALE: u128 = 10u128.pow(24);
 
 pub type TokenId = AccountId;
 
@@ -36,6 +38,9 @@ enum StorageKey {
     Troves,
     TotalDebt,
     PriceFeeds,
+    StabilityPoolDeposits,
+    CollateralRewards,
+    RewardPerShare,
 }
 
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
@@ -170,6 +175,49 @@ impl From<PriceFeedInternal> for PriceFeed {
     }
 }
 
+#[derive(BorshDeserialize, BorshSerialize, Clone)]
+struct CollateralRewardKey {
+    account_id: AccountId,
+    collateral_id: AccountId,
+}
+
+impl CollateralRewardKey {
+    fn new(account_id: &AccountId, collateral_id: &AccountId) -> Self {
+        Self {
+            account_id: account_id.clone(),
+            collateral_id: collateral_id.clone(),
+        }
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Clone)]
+struct StabilityDeposit {
+    shares: Balance,
+    reward_debt: BTreeMap<AccountId, u128>,
+    epoch: u64,
+}
+
+impl StabilityDeposit {
+    fn new(epoch: u64) -> Self {
+        Self {
+            shares: 0,
+            reward_debt: BTreeMap::new(),
+            epoch,
+        }
+    }
+
+    fn amount(&self, total_nusd: Balance, total_shares: Balance) -> Balance {
+        if self.shares == 0 || total_shares == 0 || total_nusd == 0 {
+            0
+        } else {
+            self.shares
+                .checked_mul(total_nusd)
+                .expect("Share amount overflow")
+                / total_shares
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "near_sdk::serde", tag = "action", rename_all = "snake_case")]
 enum TransferAction {
@@ -216,6 +264,12 @@ pub struct Contract {
     troves: LookupMap<TroveKey, TroveInternal>,
     total_debt: LookupMap<TokenId, Balance>,
     price_feeds: LookupMap<TokenId, PriceFeedInternal>,
+    stability_pool_deposits: LookupMap<AccountId, StabilityDeposit>,
+    collateral_rewards: LookupMap<CollateralRewardKey, Balance>,
+    reward_per_share: UnorderedMap<TokenId, u128>,
+    stability_pool_total_shares: Balance,
+    stability_pool_total_nusd: Balance,
+    stability_pool_epoch: u64,
     nusd: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
 }
@@ -246,6 +300,12 @@ impl Contract {
             troves: LookupMap::new(StorageKey::Troves),
             total_debt: LookupMap::new(StorageKey::TotalDebt),
             price_feeds: LookupMap::new(StorageKey::PriceFeeds),
+            stability_pool_deposits: LookupMap::new(StorageKey::StabilityPoolDeposits),
+            collateral_rewards: LookupMap::new(StorageKey::CollateralRewards),
+            reward_per_share: UnorderedMap::new(StorageKey::RewardPerShare),
+            stability_pool_total_shares: 0,
+            stability_pool_total_nusd: 0,
+            stability_pool_epoch: 0,
             nusd,
             metadata: LazyOption::new(StorageKey::TokenMetadata, Some(metadata)),
         }
@@ -283,6 +343,51 @@ impl Contract {
 
     pub fn get_total_debt(&self, collateral_id: AccountId) -> U128 {
         U128(self.total_debt.get(&collateral_id).unwrap_or(0))
+    }
+
+    pub fn get_stability_pool_balance(&self) -> U128 {
+        U128(self.stability_pool_total_nusd)
+    }
+
+    pub fn get_stability_pool_deposit(&self, account_id: AccountId) -> U128 {
+        self.stability_pool_deposits
+            .get(&account_id)
+            .filter(|deposit| deposit.epoch == self.stability_pool_epoch)
+            .map(|deposit| {
+                U128(deposit.amount(
+                    self.stability_pool_total_nusd,
+                    self.stability_pool_total_shares,
+                ))
+            })
+            .unwrap_or(U128(0))
+    }
+
+    pub fn get_claimable_collateral_reward(
+        &self,
+        account_id: AccountId,
+        collateral_id: AccountId,
+    ) -> U128 {
+        let key = CollateralRewardKey::new(&account_id, &collateral_id);
+        let mut total = self.collateral_rewards.get(&key).unwrap_or(0);
+        if let Some(deposit) = self.stability_pool_deposits.get(&account_id) {
+            if deposit.shares > 0 {
+                let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
+                let paid = deposit
+                    .reward_debt
+                    .get(&collateral_id)
+                    .copied()
+                    .unwrap_or(0);
+                if global > paid {
+                    let pending = deposit
+                        .shares
+                        .checked_mul(global - paid)
+                        .expect("View reward overflow")
+                        / REWARD_SCALE;
+                    total = total.checked_add(pending).expect("Reward overflow");
+                }
+            }
+        }
+        U128(total)
     }
 
     #[payable]
@@ -410,6 +515,186 @@ impl Contract {
     }
 
     #[payable]
+    pub fn deposit_to_stability_pool(&mut self, amount: U128) {
+        assert_one_yocto();
+        require!(amount.0 > 0, "Amount must be > 0");
+        let caller = env::predecessor_account_id();
+        self.settle_stability_rewards(&caller);
+        let mut deposit = self
+            .stability_pool_deposits
+            .get(&caller)
+            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
+        self.ensure_deposit_epoch(&caller, &mut deposit);
+        let shares = self.shares_from_amount(amount.0);
+        require!(shares > 0, "Shares must be > 0");
+        deposit.shares = deposit
+            .shares
+            .checked_add(shares)
+            .expect("Deposit share overflow");
+        self.stability_pool_total_shares = self
+            .stability_pool_total_shares
+            .checked_add(shares)
+            .expect("Pool share overflow");
+        self.stability_pool_total_nusd = self
+            .stability_pool_total_nusd
+            .checked_add(amount.0)
+            .expect("Pool balance overflow");
+        self.sync_reward_debt_snapshot(&mut deposit);
+        self.stability_pool_deposits.insert(&caller, &deposit);
+
+        self.nusd.internal_withdraw(&caller, amount.0);
+        self.nusd
+            .internal_deposit(&env::current_account_id(), amount.0);
+    }
+
+    #[payable]
+    pub fn withdraw_from_stability_pool(&mut self, amount: Option<U128>) {
+        assert_one_yocto();
+        let caller = env::predecessor_account_id();
+        self.settle_stability_rewards(&caller);
+        let mut deposit = self
+            .stability_pool_deposits
+            .get(&caller)
+            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
+        self.ensure_deposit_epoch(&caller, &mut deposit);
+        require!(deposit.shares > 0, "Nothing deposited");
+        let available = deposit.amount(
+            self.stability_pool_total_nusd,
+            self.stability_pool_total_shares,
+        );
+        require!(available > 0, "Pool depleted");
+        let requested = amount.map(|v| v.0).unwrap_or(available);
+        require!(requested > 0, "Amount must be > 0");
+        require!(requested <= available, "Insufficient balance");
+        let shares = self.shares_for_withdraw(requested);
+        require!(shares > 0, "Share calculation underflow");
+
+        deposit.shares = deposit
+            .shares
+            .checked_sub(shares)
+            .expect("Withdraw exceeds shares");
+        self.stability_pool_total_shares = self
+            .stability_pool_total_shares
+            .checked_sub(shares)
+            .expect("Pool share underflow");
+        self.stability_pool_total_nusd = self
+            .stability_pool_total_nusd
+            .checked_sub(requested)
+            .expect("Pool balance underflow");
+        self.stability_pool_deposits.insert(&caller, &deposit);
+
+        self.nusd
+            .internal_withdraw(&env::current_account_id(), requested);
+        self.nusd.internal_deposit(&caller, requested);
+    }
+
+    #[payable]
+    pub fn claim_collateral_reward(
+        &mut self,
+        collateral_id: AccountId,
+        amount: Option<U128>,
+    ) -> Promise {
+        assert_one_yocto();
+        let caller = env::predecessor_account_id();
+        self.settle_stability_rewards(&caller);
+        self.claim_collateral(&caller, &collateral_id, amount.map(|v| v.0))
+    }
+
+    #[payable]
+    pub fn redeem(
+        &mut self,
+        collateral_id: AccountId,
+        trove_owner: AccountId,
+        amount: U128,
+    ) -> Promise {
+        assert_one_yocto();
+        require!(amount.0 > 0, "Amount must be > 0");
+        let redeemer = env::predecessor_account_id();
+        let mut trove = self.expect_trove(&trove_owner, &collateral_id);
+        require!(trove.debt_amount >= amount.0, "Redeem exceeds trove debt");
+
+        let price = self.expect_price_internal(&collateral_id);
+        let divisor = Self::decimals_factor(price.decimals);
+        let collateral_out = amount
+            .0
+            .checked_mul(divisor)
+            .expect("Redeem amount overflow")
+            / price.price;
+        require!(collateral_out > 0, "Redeem amount too small");
+        require!(
+            trove.collateral_amount >= collateral_out,
+            "Redeem exceeds collateral"
+        );
+
+        trove.debt_amount -= amount.0;
+        trove.collateral_amount -= collateral_out;
+        trove.last_update_timestamp = Self::now_ms();
+        if trove.debt_amount == 0 && trove.collateral_amount == 0 {
+            self.troves
+                .remove(&Self::trove_key(&trove_owner, &collateral_id));
+        } else {
+            self.save_trove(&trove_owner, &collateral_id, &trove);
+        }
+        self.add_total_debt(&collateral_id, -(amount.0 as i128));
+
+        self.nusd.internal_withdraw(&redeemer, amount.0);
+        FtBurn {
+            owner_id: &redeemer,
+            amount,
+            memo: Some("cdp_redeem"),
+        }
+        .emit();
+
+        self.enqueue_collateral_reward(&redeemer, &collateral_id, collateral_out);
+        // Rewards must be claimed explicitly to receive the collateral tokens.
+        Promise::new(env::current_account_id())
+    }
+
+    #[payable]
+    pub fn liquidate(&mut self, collateral_id: AccountId, owners: Vec<AccountId>) -> U64 {
+        assert_one_yocto();
+        require!(!owners.is_empty(), "Owners required");
+        let price = self.expect_price_internal(&collateral_id);
+        let config = self.expect_config(&collateral_id);
+        let mut processed = 0u64;
+        for owner in owners {
+            let key = Self::trove_key(&owner, &collateral_id);
+            let trove = match self.troves.get(&key) {
+                Some(trove) => trove,
+                None => continue,
+            };
+            if trove.debt_amount == 0 {
+                continue;
+            }
+            let ratio = self.collateral_ratio(trove.collateral_amount, trove.debt_amount, &price);
+            if ratio >= config.min_collateral_ratio_bps as u128 {
+                continue;
+            }
+            require!(
+                self.stability_pool_total_nusd >= trove.debt_amount,
+                "Insufficient stability pool funds"
+            );
+            let penalty = trove
+                .collateral_amount
+                .checked_mul(config.liquidation_penalty_bps as u128)
+                .expect("Penalty overflow")
+                / BPS_DENOMINATOR;
+            let distributable = trove
+                .collateral_amount
+                .checked_sub(penalty)
+                .expect("Distributable underflow");
+            self.accrue_reward_per_share(&collateral_id, distributable);
+            let owner_id = self.owner_id.clone();
+            self.enqueue_collateral_reward(&owner_id, &collateral_id, penalty);
+            self.burn_from_stability_pool(trove.debt_amount);
+            self.add_total_debt(&collateral_id, -(trove.debt_amount as i128));
+            self.troves.remove(&key);
+            processed += 1;
+        }
+        U64(processed)
+    }
+
+    #[payable]
     pub fn trigger_swap_via_intents(
         &mut self,
         input_token: AccountId,
@@ -504,6 +789,183 @@ impl Contract {
             .expect("Collateral overflow");
         trove.last_update_timestamp = Self::now_ms();
         self.troves.insert(&key, &trove);
+    }
+
+    fn settle_stability_rewards(&mut self, account_id: &AccountId) {
+        let mut deposit = self
+            .stability_pool_deposits
+            .get(account_id)
+            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
+        self.ensure_deposit_epoch(account_id, &mut deposit);
+        if deposit.shares == 0 || self.stability_pool_total_shares == 0 {
+            self.stability_pool_deposits.insert(account_id, &deposit);
+            return;
+        }
+        let keys = self.reward_per_share_keys();
+        let mut updated = false;
+        for collateral_id in keys {
+            let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
+            let paid = deposit
+                .reward_debt
+                .get(&collateral_id)
+                .copied()
+                .unwrap_or(0);
+            if global > paid {
+                let delta = global - paid;
+                let pending = deposit
+                    .shares
+                    .checked_mul(delta)
+                    .expect("Reward mul overflow")
+                    / REWARD_SCALE;
+                if pending > 0 {
+                    self.enqueue_collateral_reward(account_id, &collateral_id, pending);
+                }
+            }
+            deposit.reward_debt.insert(collateral_id.clone(), global);
+            updated = true;
+        }
+        if updated {
+            self.stability_pool_deposits.insert(account_id, &deposit);
+        }
+    }
+
+    fn ensure_deposit_epoch(&mut self, account_id: &AccountId, deposit: &mut StabilityDeposit) {
+        if deposit.epoch == self.stability_pool_epoch {
+            return;
+        }
+        if deposit.shares > 0 {
+            let keys = self.reward_per_share_keys();
+            for collateral_id in keys {
+                let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
+                let paid = deposit
+                    .reward_debt
+                    .get(&collateral_id)
+                    .copied()
+                    .unwrap_or(0);
+                if global > paid {
+                    let pending = deposit
+                        .shares
+                        .checked_mul(global - paid)
+                        .expect("Epoch reward overflow")
+                        / REWARD_SCALE;
+                    if pending > 0 {
+                        self.enqueue_collateral_reward(account_id, &collateral_id, pending);
+                    }
+                }
+            }
+        }
+        deposit.reward_debt.clear();
+        deposit.shares = 0;
+        deposit.epoch = self.stability_pool_epoch;
+    }
+
+    fn shares_from_amount(&self, amount: Balance) -> Balance {
+        if self.stability_pool_total_shares == 0 || self.stability_pool_total_nusd == 0 {
+            amount
+        } else {
+            amount
+                .checked_mul(self.stability_pool_total_shares)
+                .expect("Share calc overflow")
+                / self.stability_pool_total_nusd
+        }
+    }
+
+    fn shares_for_withdraw(&self, amount: Balance) -> Balance {
+        self.shares_from_amount(amount)
+    }
+
+    fn reward_per_share_keys(&self) -> Vec<AccountId> {
+        let keys = self.reward_per_share.keys_as_vector();
+        let mut collaterals = Vec::with_capacity(keys.len() as usize);
+        for idx in 0..keys.len() {
+            collaterals.push(keys.get(idx).unwrap());
+        }
+        collaterals
+    }
+
+    fn enqueue_collateral_reward(
+        &mut self,
+        account_id: &AccountId,
+        collateral_id: &AccountId,
+        amount: Balance,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        let key = CollateralRewardKey::new(account_id, collateral_id);
+        let mut current = self.collateral_rewards.get(&key).unwrap_or(0);
+        current = current.checked_add(amount).expect("Reward overflow");
+        self.collateral_rewards.insert(&key, &current);
+    }
+
+    fn claim_collateral(
+        &mut self,
+        account_id: &AccountId,
+        collateral_id: &AccountId,
+        amount: Option<Balance>,
+    ) -> Promise {
+        let key = CollateralRewardKey::new(account_id, collateral_id);
+        let mut claimable = self.collateral_rewards.get(&key).unwrap_or(0);
+        require!(claimable > 0, "Nothing to claim");
+        let to_claim = amount.unwrap_or(claimable);
+        require!(to_claim > 0, "Amount must be > 0");
+        require!(to_claim <= claimable, "Amount exceeds claimable");
+        claimable -= to_claim;
+        if claimable == 0 {
+            self.collateral_rewards.remove(&key);
+        } else {
+            self.collateral_rewards.insert(&key, &claimable);
+        }
+        self.send_collateral(account_id.clone(), collateral_id.clone(), to_claim)
+    }
+
+    fn accrue_reward_per_share(&mut self, collateral_id: &AccountId, reward_amount: Balance) {
+        if reward_amount == 0 {
+            return;
+        }
+        if self.stability_pool_total_shares == 0 {
+            let owner_id = self.owner_id.clone();
+            self.enqueue_collateral_reward(&owner_id, collateral_id, reward_amount);
+            return;
+        }
+        let mut accrued = self.reward_per_share.get(collateral_id).unwrap_or(0);
+        accrued = accrued
+            .checked_add(
+                reward_amount
+                    .checked_mul(REWARD_SCALE)
+                    .expect("Reward scaling overflow")
+                    / self.stability_pool_total_shares,
+            )
+            .expect("Reward per share overflow");
+        self.reward_per_share.insert(collateral_id, &accrued);
+    }
+
+    fn sync_reward_debt_snapshot(&self, deposit: &mut StabilityDeposit) {
+        for collateral_id in self.reward_per_share_keys() {
+            let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
+            deposit.reward_debt.insert(collateral_id, global);
+        }
+    }
+
+    fn burn_from_stability_pool(&mut self, amount: Balance) {
+        require!(amount > 0, "Amount must be > 0");
+        require!(
+            self.stability_pool_total_nusd >= amount,
+            "Insufficient stability pool balance"
+        );
+        self.stability_pool_total_nusd -= amount;
+        self.nusd
+            .internal_withdraw(&env::current_account_id(), amount);
+        FtBurn {
+            owner_id: &env::current_account_id(),
+            amount: U128(amount),
+            memo: Some("cdp_liquidation"),
+        }
+        .emit();
+        if self.stability_pool_total_nusd == 0 {
+            self.stability_pool_total_shares = 0;
+            self.stability_pool_epoch = self.stability_pool_epoch.saturating_add(1);
+        }
     }
 
     fn send_collateral(

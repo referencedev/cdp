@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "contracts/cdp",
+    "contracts/mock-token",
     "integration-tests",
 ]
 resolver = "2"
