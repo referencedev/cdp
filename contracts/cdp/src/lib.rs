@@ -1,3 +1,9 @@
+mod types;
+use crate::types::{
+    CollateralConfig, CollateralConfigInternal, PriceFeedInternal, StorageKey, TokenId,
+    TransferAction, TroveInternal, TroveKey, GAS_FOR_CALLBACK, GAS_FOR_SWAP,
+};
+
 use near_contract_standards::fungible_token::core::FungibleTokenCore;
 use near_contract_standards::fungible_token::events::{FtBurn, FtMint};
 use near_contract_standards::fungible_token::metadata::{
@@ -9,221 +15,16 @@ use near_contract_standards::fungible_token::{Balance, FungibleToken};
 use near_contract_standards::storage_management::{
     StorageBalance, StorageBalanceBounds, StorageManagement,
 };
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::{LookupMap, UnorderedMap};
 use near_sdk::json_types::{U128, U64};
-use near_sdk::serde_json;
 use near_sdk::store::LazyOption;
 use near_sdk::{
-    assert_one_yocto, env, ext_contract, log, near_bindgen, require, AccountId, BorshStorageKey,
-    Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue, PromiseResult,
+    assert_one_yocto, env, ext_contract, log, near, near_bindgen, require, AccountId, NearToken,
+    PanicOnDefault, Promise, PromiseOrValue, PromiseResult,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
-const BPS_DENOMINATOR: u128 = 10_000;
-const GAS_FOR_SWAP: Gas = Gas::from_tgas(50);
-const GAS_FOR_CALLBACK: Gas = Gas::from_tgas(25);
-const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(10);
-const REWARD_SCALE: u128 = 10u128.pow(24);
-
-pub type TokenId = AccountId;
-
-#[derive(BorshSerialize, BorshStorageKey)]
-enum StorageKey {
-    FungibleToken,
-    TokenMetadata,
-    CollateralConfigs,
-    Troves,
-    TotalDebt,
-    PriceFeeds,
-    StabilityPoolDeposits,
-    CollateralRewards,
-    RewardPerShare,
-}
-
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(crate = "near_sdk::serde")]
-pub struct CollateralConfig {
-    pub oracle_price_id: String,
-    pub min_collateral_ratio_bps: u16,
-    pub recovery_collateral_ratio_bps: u16,
-    #[schemars(with = "String")]
-    pub debt_ceiling: U128,
-    pub liquidation_penalty_bps: u16,
-    pub stability_pool_mode: StabilityPoolMode,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone)]
-struct CollateralConfigInternal {
-    pub oracle_price_id: String,
-    pub min_collateral_ratio_bps: u16,
-    pub recovery_collateral_ratio_bps: u16,
-    pub debt_ceiling: Balance,
-    pub liquidation_penalty_bps: u16,
-    pub stability_pool_mode: StabilityPoolMode,
-}
-
-impl From<CollateralConfigInternal> for CollateralConfig {
-    fn from(value: CollateralConfigInternal) -> Self {
-        Self {
-            oracle_price_id: value.oracle_price_id,
-            min_collateral_ratio_bps: value.min_collateral_ratio_bps,
-            recovery_collateral_ratio_bps: value.recovery_collateral_ratio_bps,
-            debt_ceiling: U128(value.debt_ceiling),
-            liquidation_penalty_bps: value.liquidation_penalty_bps,
-            stability_pool_mode: value.stability_pool_mode,
-        }
-    }
-}
-
-impl From<CollateralConfig> for CollateralConfigInternal {
-    fn from(value: CollateralConfig) -> Self {
-        Self {
-            oracle_price_id: value.oracle_price_id,
-            min_collateral_ratio_bps: value.min_collateral_ratio_bps,
-            recovery_collateral_ratio_bps: value.recovery_collateral_ratio_bps,
-            debt_ceiling: value.debt_ceiling.0,
-            liquidation_penalty_bps: value.liquidation_penalty_bps,
-            stability_pool_mode: value.stability_pool_mode,
-        }
-    }
-}
-
-#[derive(
-    BorshDeserialize, BorshSerialize, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema,
-)]
-#[serde(crate = "near_sdk::serde")]
-pub enum StabilityPoolMode {
-    Dedicated,
-    Shared,
-}
-
-impl Default for StabilityPoolMode {
-    fn default() -> Self {
-        Self::Dedicated
-    }
-}
-
-#[derive(BorshDeserialize, BorshSerialize)]
-struct TroveKey {
-    owner_id: AccountId,
-    collateral_id: AccountId,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone)]
-struct TroveInternal {
-    owner_id: AccountId,
-    collateral_id: AccountId,
-    collateral_amount: Balance,
-    debt_amount: Balance,
-    last_update_timestamp: u64,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(crate = "near_sdk::serde")]
-pub struct Trove {
-    #[schemars(with = "String")]
-    pub owner_id: AccountId,
-    #[schemars(with = "String")]
-    pub collateral_id: AccountId,
-    #[schemars(with = "String")]
-    pub collateral_amount: U128,
-    #[schemars(with = "String")]
-    pub debt_amount: U128,
-    #[schemars(with = "String")]
-    pub last_update_timestamp: U64,
-}
-
-impl From<TroveInternal> for Trove {
-    fn from(value: TroveInternal) -> Self {
-        Self {
-            owner_id: value.owner_id,
-            collateral_id: value.collateral_id,
-            collateral_amount: U128(value.collateral_amount),
-            debt_amount: U128(value.debt_amount),
-            last_update_timestamp: U64(value.last_update_timestamp),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(crate = "near_sdk::serde")]
-pub struct PriceFeed {
-    #[schemars(with = "String")]
-    pub price: U128,
-    pub decimals: u8,
-    #[schemars(with = "String")]
-    pub last_update_timestamp: U64,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone)]
-struct PriceFeedInternal {
-    pub price: Balance,
-    pub decimals: u8,
-    pub last_update_timestamp: u64,
-}
-
-impl From<PriceFeedInternal> for PriceFeed {
-    fn from(value: PriceFeedInternal) -> Self {
-        Self {
-            price: U128(value.price),
-            decimals: value.decimals,
-            last_update_timestamp: U64(value.last_update_timestamp),
-        }
-    }
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone)]
-struct CollateralRewardKey {
-    account_id: AccountId,
-    collateral_id: AccountId,
-}
-
-impl CollateralRewardKey {
-    fn new(account_id: &AccountId, collateral_id: &AccountId) -> Self {
-        Self {
-            account_id: account_id.clone(),
-            collateral_id: collateral_id.clone(),
-        }
-    }
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Clone)]
-struct StabilityDeposit {
-    shares: Balance,
-    reward_debt: BTreeMap<AccountId, u128>,
-    epoch: u64,
-}
-
-impl StabilityDeposit {
-    fn new(epoch: u64) -> Self {
-        Self {
-            shares: 0,
-            reward_debt: BTreeMap::new(),
-            epoch,
-        }
-    }
-
-    fn amount(&self, total_nusd: Balance, total_shares: Balance) -> Balance {
-        if self.shares == 0 || total_shares == 0 || total_nusd == 0 {
-            0
-        } else {
-            self.shares
-                .checked_mul(total_nusd)
-                .expect("Share amount overflow")
-                / total_shares
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(crate = "near_sdk::serde", tag = "action", rename_all = "snake_case")]
-enum TransferAction {
-    DepositCollateral { target_account: Option<AccountId> },
-    RepayDebt { collateral_id: AccountId },
-}
+mod internal;
+mod views;
 
 #[ext_contract(ext_intents)]
 pub trait NearIntentsDex {
@@ -254,8 +55,8 @@ trait ContractCallbacks {
     ) -> bool;
 }
 
-#[near_bindgen]
-#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[near(contract_state)]
+#[derive(PanicOnDefault)]
 pub struct Contract {
     owner_id: AccountId,
     intent_router_id: AccountId,
@@ -264,8 +65,8 @@ pub struct Contract {
     troves: LookupMap<TroveKey, TroveInternal>,
     total_debt: LookupMap<TokenId, Balance>,
     price_feeds: LookupMap<TokenId, PriceFeedInternal>,
-    stability_pool_deposits: LookupMap<AccountId, StabilityDeposit>,
-    collateral_rewards: LookupMap<CollateralRewardKey, Balance>,
+    stability_pool_deposits: LookupMap<AccountId, types::StabilityDeposit>,
+    collateral_rewards: LookupMap<types::CollateralRewardKey, Balance>,
     reward_per_share: UnorderedMap<TokenId, u128>,
     stability_pool_total_shares: Balance,
     stability_pool_total_nusd: Balance,
@@ -309,85 +110,6 @@ impl Contract {
             nusd,
             metadata: LazyOption::new(StorageKey::TokenMetadata, Some(metadata)),
         }
-    }
-
-    pub fn owner_id(&self) -> AccountId {
-        self.owner_id.clone()
-    }
-
-    pub fn intent_router_id(&self) -> AccountId {
-        self.intent_router_id.clone()
-    }
-
-    pub fn pyth_oracle_id(&self) -> AccountId {
-        self.pyth_oracle_id.clone()
-    }
-
-    pub fn list_collateral_tokens(&self) -> Vec<AccountId> {
-        self.configs.keys_as_vector().to_vec()
-    }
-
-    pub fn get_collateral_config(&self, token_id: AccountId) -> Option<CollateralConfig> {
-        self.configs.get(&token_id).map(Into::into)
-    }
-
-    pub fn get_price(&self, collateral_id: AccountId) -> Option<PriceFeed> {
-        self.price_feeds.get(&collateral_id).map(Into::into)
-    }
-
-    pub fn get_trove(&self, owner_id: AccountId, collateral_id: AccountId) -> Option<Trove> {
-        self.troves
-            .get(&Self::trove_key(&owner_id, &collateral_id))
-            .map(Into::into)
-    }
-
-    pub fn get_total_debt(&self, collateral_id: AccountId) -> U128 {
-        U128(self.total_debt.get(&collateral_id).unwrap_or(0))
-    }
-
-    pub fn get_stability_pool_balance(&self) -> U128 {
-        U128(self.stability_pool_total_nusd)
-    }
-
-    pub fn get_stability_pool_deposit(&self, account_id: AccountId) -> U128 {
-        self.stability_pool_deposits
-            .get(&account_id)
-            .filter(|deposit| deposit.epoch == self.stability_pool_epoch)
-            .map(|deposit| {
-                U128(deposit.amount(
-                    self.stability_pool_total_nusd,
-                    self.stability_pool_total_shares,
-                ))
-            })
-            .unwrap_or(U128(0))
-    }
-
-    pub fn get_claimable_collateral_reward(
-        &self,
-        account_id: AccountId,
-        collateral_id: AccountId,
-    ) -> U128 {
-        let key = CollateralRewardKey::new(&account_id, &collateral_id);
-        let mut total = self.collateral_rewards.get(&key).unwrap_or(0);
-        if let Some(deposit) = self.stability_pool_deposits.get(&account_id) {
-            if deposit.shares > 0 {
-                let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
-                let paid = deposit
-                    .reward_debt
-                    .get(&collateral_id)
-                    .copied()
-                    .unwrap_or(0);
-                if global > paid {
-                    let pending = deposit
-                        .shares
-                        .checked_mul(global - paid)
-                        .expect("View reward overflow")
-                        / REWARD_SCALE;
-                    total = total.checked_add(pending).expect("Reward overflow");
-                }
-            }
-        }
-        U128(total)
     }
 
     #[payable]
@@ -523,7 +245,7 @@ impl Contract {
         let mut deposit = self
             .stability_pool_deposits
             .get(&caller)
-            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
+            .unwrap_or_else(|| types::StabilityDeposit::new(self.stability_pool_epoch));
         self.ensure_deposit_epoch(&caller, &mut deposit);
         let shares = self.shares_from_amount(amount.0);
         require!(shares > 0, "Shares must be > 0");
@@ -555,7 +277,7 @@ impl Contract {
         let mut deposit = self
             .stability_pool_deposits
             .get(&caller)
-            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
+            .unwrap_or_else(|| types::StabilityDeposit::new(self.stability_pool_epoch));
         self.ensure_deposit_epoch(&caller, &mut deposit);
         require!(deposit.shares > 0, "Nothing deposited");
         let available = deposit.amount(
@@ -646,7 +368,6 @@ impl Contract {
         .emit();
 
         self.enqueue_collateral_reward(&redeemer, &collateral_id, collateral_out);
-        // Rewards must be claimed explicitly to receive the collateral tokens.
         Promise::new(env::current_account_id())
     }
 
@@ -678,7 +399,7 @@ impl Contract {
                 .collateral_amount
                 .checked_mul(config.liquidation_penalty_bps as u128)
                 .expect("Penalty overflow")
-                / BPS_DENOMINATOR;
+                / crate::types::BPS_DENOMINATOR;
             let distributable = trove
                 .collateral_amount
                 .checked_sub(penalty)
@@ -766,327 +487,6 @@ impl Contract {
         self.save_trove(owner_id, collateral_id, &trove);
         self.add_total_debt(collateral_id, -(amount as i128));
     }
-
-    fn internal_deposit_collateral(
-        &mut self,
-        owner_id: AccountId,
-        collateral_id: AccountId,
-        amount: Balance,
-    ) {
-        require!(amount > 0, "Amount must be > 0");
-        self.expect_config(&collateral_id);
-        let key = Self::trove_key(&owner_id, &collateral_id);
-        let mut trove = self.troves.get(&key).unwrap_or(TroveInternal {
-            owner_id: owner_id.clone(),
-            collateral_id: collateral_id.clone(),
-            collateral_amount: 0,
-            debt_amount: 0,
-            last_update_timestamp: Self::now_ms(),
-        });
-        trove.collateral_amount = trove
-            .collateral_amount
-            .checked_add(amount)
-            .expect("Collateral overflow");
-        trove.last_update_timestamp = Self::now_ms();
-        self.troves.insert(&key, &trove);
-    }
-
-    fn settle_stability_rewards(&mut self, account_id: &AccountId) {
-        let mut deposit = self
-            .stability_pool_deposits
-            .get(account_id)
-            .unwrap_or_else(|| StabilityDeposit::new(self.stability_pool_epoch));
-        self.ensure_deposit_epoch(account_id, &mut deposit);
-        if deposit.shares == 0 || self.stability_pool_total_shares == 0 {
-            self.stability_pool_deposits.insert(account_id, &deposit);
-            return;
-        }
-        let keys = self.reward_per_share_keys();
-        let mut updated = false;
-        for collateral_id in keys {
-            let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
-            let paid = deposit
-                .reward_debt
-                .get(&collateral_id)
-                .copied()
-                .unwrap_or(0);
-            if global > paid {
-                let delta = global - paid;
-                let pending = deposit
-                    .shares
-                    .checked_mul(delta)
-                    .expect("Reward mul overflow")
-                    / REWARD_SCALE;
-                if pending > 0 {
-                    self.enqueue_collateral_reward(account_id, &collateral_id, pending);
-                }
-            }
-            deposit.reward_debt.insert(collateral_id.clone(), global);
-            updated = true;
-        }
-        if updated {
-            self.stability_pool_deposits.insert(account_id, &deposit);
-        }
-    }
-
-    fn ensure_deposit_epoch(&mut self, account_id: &AccountId, deposit: &mut StabilityDeposit) {
-        if deposit.epoch == self.stability_pool_epoch {
-            return;
-        }
-        if deposit.shares > 0 {
-            let keys = self.reward_per_share_keys();
-            for collateral_id in keys {
-                let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
-                let paid = deposit
-                    .reward_debt
-                    .get(&collateral_id)
-                    .copied()
-                    .unwrap_or(0);
-                if global > paid {
-                    let pending = deposit
-                        .shares
-                        .checked_mul(global - paid)
-                        .expect("Epoch reward overflow")
-                        / REWARD_SCALE;
-                    if pending > 0 {
-                        self.enqueue_collateral_reward(account_id, &collateral_id, pending);
-                    }
-                }
-            }
-        }
-        deposit.reward_debt.clear();
-        deposit.shares = 0;
-        deposit.epoch = self.stability_pool_epoch;
-    }
-
-    fn shares_from_amount(&self, amount: Balance) -> Balance {
-        if self.stability_pool_total_shares == 0 || self.stability_pool_total_nusd == 0 {
-            amount
-        } else {
-            amount
-                .checked_mul(self.stability_pool_total_shares)
-                .expect("Share calc overflow")
-                / self.stability_pool_total_nusd
-        }
-    }
-
-    fn shares_for_withdraw(&self, amount: Balance) -> Balance {
-        self.shares_from_amount(amount)
-    }
-
-    fn reward_per_share_keys(&self) -> Vec<AccountId> {
-        let keys = self.reward_per_share.keys_as_vector();
-        let mut collaterals = Vec::with_capacity(keys.len() as usize);
-        for idx in 0..keys.len() {
-            collaterals.push(keys.get(idx).unwrap());
-        }
-        collaterals
-    }
-
-    fn enqueue_collateral_reward(
-        &mut self,
-        account_id: &AccountId,
-        collateral_id: &AccountId,
-        amount: Balance,
-    ) {
-        if amount == 0 {
-            return;
-        }
-        let key = CollateralRewardKey::new(account_id, collateral_id);
-        let mut current = self.collateral_rewards.get(&key).unwrap_or(0);
-        current = current.checked_add(amount).expect("Reward overflow");
-        self.collateral_rewards.insert(&key, &current);
-    }
-
-    fn claim_collateral(
-        &mut self,
-        account_id: &AccountId,
-        collateral_id: &AccountId,
-        amount: Option<Balance>,
-    ) -> Promise {
-        let key = CollateralRewardKey::new(account_id, collateral_id);
-        let mut claimable = self.collateral_rewards.get(&key).unwrap_or(0);
-        require!(claimable > 0, "Nothing to claim");
-        let to_claim = amount.unwrap_or(claimable);
-        require!(to_claim > 0, "Amount must be > 0");
-        require!(to_claim <= claimable, "Amount exceeds claimable");
-        claimable -= to_claim;
-        if claimable == 0 {
-            self.collateral_rewards.remove(&key);
-        } else {
-            self.collateral_rewards.insert(&key, &claimable);
-        }
-        self.send_collateral(account_id.clone(), collateral_id.clone(), to_claim)
-    }
-
-    fn accrue_reward_per_share(&mut self, collateral_id: &AccountId, reward_amount: Balance) {
-        if reward_amount == 0 {
-            return;
-        }
-        if self.stability_pool_total_shares == 0 {
-            let owner_id = self.owner_id.clone();
-            self.enqueue_collateral_reward(&owner_id, collateral_id, reward_amount);
-            return;
-        }
-        let mut accrued = self.reward_per_share.get(collateral_id).unwrap_or(0);
-        accrued = accrued
-            .checked_add(
-                reward_amount
-                    .checked_mul(REWARD_SCALE)
-                    .expect("Reward scaling overflow")
-                    / self.stability_pool_total_shares,
-            )
-            .expect("Reward per share overflow");
-        self.reward_per_share.insert(collateral_id, &accrued);
-    }
-
-    fn sync_reward_debt_snapshot(&self, deposit: &mut StabilityDeposit) {
-        for collateral_id in self.reward_per_share_keys() {
-            let global = self.reward_per_share.get(&collateral_id).unwrap_or(0);
-            deposit.reward_debt.insert(collateral_id, global);
-        }
-    }
-
-    fn burn_from_stability_pool(&mut self, amount: Balance) {
-        require!(amount > 0, "Amount must be > 0");
-        require!(
-            self.stability_pool_total_nusd >= amount,
-            "Insufficient stability pool balance"
-        );
-        self.stability_pool_total_nusd -= amount;
-        self.nusd
-            .internal_withdraw(&env::current_account_id(), amount);
-        FtBurn {
-            owner_id: &env::current_account_id(),
-            amount: U128(amount),
-            memo: Some("cdp_liquidation"),
-        }
-        .emit();
-        if self.stability_pool_total_nusd == 0 {
-            self.stability_pool_total_shares = 0;
-            self.stability_pool_epoch = self.stability_pool_epoch.saturating_add(1);
-        }
-    }
-
-    fn send_collateral(
-        &self,
-        receiver_id: AccountId,
-        token_id: AccountId,
-        amount: Balance,
-    ) -> Promise {
-        require!(amount > 0, "Nothing to transfer");
-        ext_ft::ext(token_id)
-            .with_attached_deposit(NearToken::from_yoctonear(1))
-            .with_static_gas(GAS_FOR_FT_TRANSFER)
-            .ft_transfer(
-                receiver_id,
-                U128(amount),
-                Some("cdp_collateral_withdrawal".to_string()),
-            )
-    }
-
-    fn expect_config(&self, collateral_id: &AccountId) -> CollateralConfigInternal {
-        self.configs
-            .get(collateral_id)
-            .unwrap_or_else(|| env::panic_str("Collateral not supported"))
-    }
-
-    fn expect_price_internal(&self, collateral_id: &AccountId) -> PriceFeedInternal {
-        self.price_feeds
-            .get(collateral_id)
-            .unwrap_or_else(|| env::panic_str("Price not available"))
-    }
-
-    fn expect_trove(&self, owner_id: &AccountId, collateral_id: &AccountId) -> TroveInternal {
-        self.troves
-            .get(&Self::trove_key(owner_id, collateral_id))
-            .unwrap_or_else(|| env::panic_str("Trove not found"))
-    }
-
-    fn save_trove(
-        &mut self,
-        owner_id: &AccountId,
-        collateral_id: &AccountId,
-        trove: &TroveInternal,
-    ) {
-        self.troves
-            .insert(&Self::trove_key(owner_id, collateral_id), trove);
-    }
-
-    fn add_total_debt(&mut self, collateral_id: &AccountId, delta: i128) {
-        let mut total = self.total_debt.get(collateral_id).unwrap_or(0);
-        if delta >= 0 {
-            let increased = total
-                .checked_add(delta as u128)
-                .expect("Total debt overflow");
-            self.ensure_debt_ceiling(collateral_id, increased);
-            total = increased;
-        } else {
-            let reduction = (-delta) as u128;
-            require!(total >= reduction, "Debt underflow");
-            total -= reduction;
-        }
-        if total == 0 {
-            self.total_debt.remove(collateral_id);
-        } else {
-            self.total_debt.insert(collateral_id, &total);
-        }
-    }
-
-    fn ensure_debt_ceiling(&self, collateral_id: &AccountId, new_total: Balance) {
-        let config = self.expect_config(collateral_id);
-        require!(
-            new_total <= config.debt_ceiling,
-            "Collateral debt ceiling reached"
-        );
-    }
-
-    fn collateral_ratio(
-        &self,
-        collateral: Balance,
-        debt: Balance,
-        price: &PriceFeedInternal,
-    ) -> u128 {
-        if debt == 0 {
-            return u128::MAX;
-        }
-        let price_value = price.price;
-        let divisor = Self::decimals_factor(price.decimals);
-        let value = collateral
-            .checked_mul(price_value)
-            .expect("Collateral value overflow")
-            / divisor;
-        value.checked_mul(BPS_DENOMINATOR).expect("Ratio overflow") / debt
-    }
-
-    fn decimals_factor(decimals: u8) -> u128 {
-        10u128.pow(decimals as u32)
-    }
-
-    fn trove_key(owner_id: &AccountId, collateral_id: &AccountId) -> TroveKey {
-        TroveKey {
-            owner_id: owner_id.clone(),
-            collateral_id: collateral_id.clone(),
-        }
-    }
-
-    fn parse_transfer_action(msg: &str) -> TransferAction {
-        if msg.trim().is_empty() {
-            TransferAction::DepositCollateral {
-                target_account: None,
-            }
-        } else {
-            serde_json::from_str(msg).unwrap_or_else(|_| env::panic_str("Invalid transfer msg"))
-        }
-    }
-
-    fn now_ms() -> u64 {
-        env::block_timestamp() / 1_000_000
-    }
-
-    fn assert_owner(&self) {
-        require!(env::predecessor_account_id() == self.owner_id, "Owner only");
-    }
 }
 
 #[near_bindgen]
@@ -1129,6 +529,47 @@ impl FungibleTokenResolver for Contract {
             self.nusd
                 .internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
         used_amount.into()
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenReceiver for Contract {
+    fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        let token_id = env::predecessor_account_id();
+        let action = Self::parse_transfer_action(&msg);
+
+        if token_id == env::current_account_id() {
+            match action {
+                TransferAction::RepayDebt { collateral_id } => {
+                    self.nusd
+                        .internal_withdraw(&env::current_account_id(), amount.0);
+                    FtBurn {
+                        owner_id: &sender_id,
+                        amount,
+                        memo: Some("cdp_repay_via_ft"),
+                    }
+                    .emit();
+                    self.internal_repay(&sender_id, &collateral_id, amount.0);
+                }
+                _ => env::panic_str("Unsupported action for nUSD"),
+            }
+        } else {
+            match action {
+                TransferAction::DepositCollateral { target_account } => {
+                    let owner = target_account.unwrap_or_else(|| sender_id.clone());
+                    self.internal_deposit_collateral(owner, token_id, amount.0);
+                }
+                TransferAction::RepayDebt { .. } => {
+                    env::panic_str("Repay action invalid for external tokens")
+                }
+            }
+        }
+        PromiseOrValue::Value(U128(0))
     }
 }
 
@@ -1180,50 +621,10 @@ impl FungibleTokenMetadataProvider for Contract {
     }
 }
 
-#[near_bindgen]
-impl FungibleTokenReceiver for Contract {
-    fn ft_on_transfer(
-        &mut self,
-        sender_id: AccountId,
-        amount: U128,
-        msg: String,
-    ) -> PromiseOrValue<U128> {
-        let token_id = env::predecessor_account_id();
-        let action = Self::parse_transfer_action(&msg);
-
-        if token_id == env::current_account_id() {
-            match action {
-                TransferAction::RepayDebt { collateral_id } => {
-                    self.nusd
-                        .internal_withdraw(&env::current_account_id(), amount.0);
-                    FtBurn {
-                        owner_id: &sender_id,
-                        amount,
-                        memo: Some("cdp_repay_via_ft"),
-                    }
-                    .emit();
-                    self.internal_repay(&sender_id, &collateral_id, amount.0);
-                }
-                _ => env::panic_str("Unsupported action for nUSD"),
-            }
-        } else {
-            match action {
-                TransferAction::DepositCollateral { target_account } => {
-                    let owner = target_account.unwrap_or_else(|| sender_id.clone());
-                    self.internal_deposit_collateral(owner, token_id, amount.0);
-                }
-                TransferAction::RepayDebt { .. } => {
-                    env::panic_str("Repay action invalid for external tokens")
-                }
-            }
-        }
-        PromiseOrValue::Value(U128(0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::StabilityPoolMode;
     use near_sdk::test_utils::VMContextBuilder;
     use near_sdk::{testing_env, NearToken};
 
@@ -1342,5 +743,51 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
         let _ = contract.withdraw_collateral(collateral_token(), U128(1_000), None);
+    }
+
+    #[test]
+    fn new_deposit_snapshot_prevents_reward_sniping() {
+        let mut contract = setup_contract();
+        let collateral = collateral_token();
+        let alice = alice();
+
+        contract
+            .reward_per_share
+            .insert(&collateral, &types::REWARD_SCALE);
+        contract.stability_pool_total_shares = 1_000;
+        contract.stability_pool_total_nusd = 1_000;
+
+        let mut deposit = types::StabilityDeposit::new(contract.stability_pool_epoch);
+        deposit.shares = 1_000;
+        contract.sync_reward_debt_snapshot(&mut deposit);
+        contract.stability_pool_deposits.insert(&alice, &deposit);
+
+        contract.settle_stability_rewards(&alice);
+
+        let reward_after = contract
+            .collateral_rewards
+            .get(&types::CollateralRewardKey::new(&alice, &collateral))
+            .unwrap_or(0);
+        assert_eq!(
+            reward_after, 0,
+            "new deposit should not inherit historical rewards"
+        );
+    }
+
+    #[test]
+    fn accrue_without_deposit_rewards_owner() {
+        let mut contract = setup_contract();
+        let collateral = collateral_token();
+
+        contract.accrue_reward_per_share(&collateral, 500);
+
+        let owner_reward = contract
+            .collateral_rewards
+            .get(&types::CollateralRewardKey::new(
+                &contract.owner_id,
+                &collateral,
+            ))
+            .unwrap_or(0);
+        assert_eq!(owner_reward, 500, "owner should receive direct reward");
     }
 }
